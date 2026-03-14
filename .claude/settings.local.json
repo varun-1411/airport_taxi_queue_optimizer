@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /home/varun/airport_taxi_queue_optimizer -type f -name *.py)"
+    ]
+  }
+}
