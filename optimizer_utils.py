@@ -580,3 +580,322 @@ def optimize_full_day(lambdas, mus_init, alpha1, alpha2, config,
         'details': details,
         'history': history,
     }
+
+
+# ══════════════════════════════════════════════════════════════
+# DO-NOTHING EVALUATION
+# ══════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def run_do_nothing(lambdas, mus_init, alpha1, alpha2, config,
+                   pi0=None, device='cpu', dtype=torch.float32):
+    """Evaluate zero controls (no intervention)."""
+    n = len(lambdas)
+    pad_mu0, pad_mus = config.get_delay_blocks()
+
+    mu_0_t = torch.tensor(mus_init, dtype=dtype, device=device)
+    lambda_t = torch.tensor(lambdas, dtype=dtype, device=device)
+    alpha1_t = torch.tensor(alpha1, dtype=dtype, device=device)
+    alpha2_t = torch.tensor(alpha2, dtype=dtype, device=device)
+    z = torch.zeros(n, dtype=dtype, device=device)
+
+    pi0_t = resolve_pi0(pi0, config, device, dtype)
+    eff = build_eff_nr_zero_pad(mu_0_t, z, z, pad_mu0, pad_mus)
+    obj, details = compute_objective_detailed(
+        pi0_t, eff, lambda_t, alpha1_t, alpha2_t, z, z, config, device, dtype)
+
+    return {
+        'objective': obj.item(),
+        'details': details,
+        'mu_add': np.zeros(n),
+        'mu_remove': np.zeros(n),
+        'eff_nr': eff.cpu().numpy(),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# GREEDY ROLLING-HORIZON OPTIMIZER
+# ══════════════════════════════════════════════════════════════
+
+def optimize_greedy(lambdas, mus_init, alpha1, alpha2, config,
+                    commit_size=36, buffer_size=None,
+                    max_iter=200, lr=1.0, epsilon=1e-1, seed=42,
+                    sample_state=False, pi0=None,
+                    device='cpu', dtype=torch.float32, verbose=False):
+    """
+    Greedy rolling-horizon Adam optimization.
+
+    Parameters
+    ----------
+    commit_size : int, intervals to commit per window
+    buffer_size : int or None, lookahead buffer (default=pad_mus)
+    sample_state : bool, sample state at window boundaries
+    pi0 : initial distribution (None, str path, tensor, or (s,n) tuple)
+
+    Returns
+    -------
+    dict with mu_add, mu_remove, objective, eff_nr, details,
+         window_objectives, sampled_states
+    """
+    torch.manual_seed(seed)
+    rng = np.random.RandomState(seed)
+
+    n = len(lambdas)
+    pad_mu0, pad_mus = config.get_delay_blocks()
+    if buffer_size is None:
+        buffer_size = pad_mus
+
+    lambda_t = torch.tensor(lambdas, dtype=dtype, device=device)
+    mu_0_t = torch.tensor(mus_init, dtype=dtype, device=device)
+    alpha1_t = torch.tensor(alpha1, dtype=dtype, device=device)
+    alpha2_t = torch.tensor(alpha2, dtype=dtype, device=device)
+
+    mu_add_committed = np.zeros(n, dtype=np.float64)
+    mu_remove_committed = np.zeros(n, dtype=np.float64)
+    pi_current = resolve_pi0(pi0, config, device, dtype)
+
+    window_objectives = []
+    sampled_states = []
+    ell_start = 0
+
+    while ell_start < n:
+        ell_commit_end = min(ell_start + commit_size, n)
+        ell_opt_end = min(ell_commit_end + buffer_size, n)
+        W_commit = ell_commit_end - ell_start
+        W_opt = ell_opt_end - ell_start
+
+        mu_add_w = torch.nn.Parameter(
+            torch.tensor(rng.uniform(0, 0.1, W_opt), dtype=dtype, device=device))
+        mu_remove_w = torch.nn.Parameter(
+            torch.tensor(rng.uniform(0, 0.05, W_opt), dtype=dtype, device=device))
+
+        opt = torch.optim.Adam([mu_add_w, mu_remove_w], lr=lr)
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='min', factor=0.1, patience=15)
+
+        pi_frozen = pi_current.detach().clone()
+        prev_obj = None
+
+        for step in range(max_iter):
+            opt.zero_grad()
+            eff_nr_w = build_window_eff_nr(
+                ell_start, W_opt, mu_add_w, mu_remove_w,
+                mu_add_committed, mu_remove_committed,
+                mu_0_t, pad_mu0, pad_mus, n, device, dtype)
+
+            obj, _ = compute_objective(
+                pi_frozen, eff_nr_w,
+                lambda_t[ell_start:ell_opt_end],
+                alpha1_t[ell_start:ell_opt_end],
+                alpha2_t[ell_start:ell_opt_end],
+                mu_add_w, mu_remove_w, config, device, dtype)
+
+            obj.backward()
+            opt.step()
+
+            with torch.no_grad():
+                mu_add_w.data.clamp_(min=0.0)
+                mu_remove_w.data.clamp_(min=0.0)
+                for j in range(W_opt):
+                    mu_remove_w.data[j].clamp_(max=mus_init[ell_start + j])
+                v = obj.item()
+                if prev_obj is not None and abs(prev_obj - v) < epsilon:
+                    break
+                prev_obj = v
+            sch.step(v)
+
+        window_objectives.append(v)
+
+        with torch.no_grad():
+            mu_add_committed[ell_start:ell_commit_end] = \
+                mu_add_w.data[:W_commit].cpu().numpy()
+            mu_remove_committed[ell_start:ell_commit_end] = \
+                mu_remove_w.data[:W_commit].cpu().numpy()
+
+            eff_nr_full = build_eff_nr_zero_pad(
+                mu_0_t,
+                torch.tensor(mu_add_committed, dtype=dtype, device=device),
+                torch.tensor(mu_remove_committed, dtype=dtype, device=device),
+                pad_mu0, pad_mus)
+
+            pi_current = propagate_pi(
+                pi_current, eff_nr_full[ell_start:ell_commit_end],
+                lambda_t[ell_start:ell_commit_end], config, device, dtype)
+
+            if sample_state:
+                pi_current, s_samp, n_samp = sample_state_from_pi(pi_current, config)
+                sampled_states.append((s_samp, n_samp))
+                if verbose:
+                    print(f"  Window {len(window_objectives)-1}: "
+                          f"obj={v:.2f}, sampled (s={s_samp}, n={n_samp})")
+
+        ell_start = ell_commit_end
+
+    # Final evaluation
+    total_obj, details, ts = evaluate_full_day(
+        mu_add_committed, mu_remove_committed,
+        lambdas, mus_init, alpha1, alpha2, config,
+        pi0=pi0, device=device, dtype=dtype)
+
+    return {
+        'mu_add': mu_add_committed,
+        'mu_remove': mu_remove_committed,
+        'objective': total_obj,
+        'details': details,
+        'window_objectives': window_objectives,
+        'sampled_states': sampled_states,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# MPC (RECEDING-HORIZON) OPTIMIZER
+# ══════════════════════════════════════════════════════════════
+
+def optimize_mpc(lambdas, mus_init, alpha1, alpha2, config,
+                 commit_size=36,
+                 max_iter=500, lr=1.0, epsilon=1e-1, seed=42,
+                 sample_state=False, pi0=None,
+                 warm_start=None,
+                 device='cpu', dtype=torch.float32, verbose=False):
+    """
+    Receding-horizon MPC Adam optimization.
+
+    Each window optimizes ALL remaining intervals, commits first commit_size.
+
+    Parameters
+    ----------
+    warm_start : dict or None, {'mu_add': array, 'mu_remove': array}
+    sample_state : bool, sample state at window boundaries
+    pi0 : initial distribution
+
+    Returns
+    -------
+    dict with mu_add, mu_remove, objective, details,
+         window_objectives, sampled_states
+    """
+    torch.manual_seed(seed)
+    rng = np.random.RandomState(seed)
+
+    n = len(lambdas)
+    pad_mu0, pad_mus = config.get_delay_blocks()
+
+    lambda_t = torch.tensor(lambdas, dtype=dtype, device=device)
+    mu_0_t = torch.tensor(mus_init, dtype=dtype, device=device)
+    alpha1_t = torch.tensor(alpha1, dtype=dtype, device=device)
+    alpha2_t = torch.tensor(alpha2, dtype=dtype, device=device)
+
+    mu_add_committed = np.zeros(n, dtype=np.float64)
+    mu_remove_committed = np.zeros(n, dtype=np.float64)
+    pi_current = resolve_pi0(pi0, config, device, dtype)
+
+    warm_add = None
+    warm_remove = None
+    window_objectives = []
+    sampled_states = []
+    ell_start = 0
+
+    while ell_start < n:
+        ell_commit_end = min(ell_start + commit_size, n)
+        W_commit = ell_commit_end - ell_start
+        W_opt = n - ell_start
+
+        # Initialize
+        if warm_add is not None:
+            init_add = torch.tensor(warm_add, dtype=dtype, device=device)
+            init_remove = torch.tensor(warm_remove, dtype=dtype, device=device)
+        elif warm_start is not None:
+            init_add = torch.tensor(
+                warm_start['mu_add'][ell_start:], dtype=dtype, device=device)
+            init_remove = torch.tensor(
+                warm_start['mu_remove'][ell_start:], dtype=dtype, device=device)
+        else:
+            init_add = torch.tensor(
+                rng.uniform(0, 0.1, W_opt), dtype=dtype, device=device)
+            init_remove = torch.tensor(
+                rng.uniform(0, 0.05, W_opt), dtype=dtype, device=device)
+
+        mu_add_w = torch.nn.Parameter(init_add.clone())
+        mu_remove_w = torch.nn.Parameter(init_remove.clone())
+
+        opt = torch.optim.Adam([mu_add_w, mu_remove_w], lr=lr)
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='min', factor=0.1, patience=15)
+
+        pi_frozen = pi_current.detach().clone()
+        prev_obj = None
+
+        for step in range(max_iter):
+            opt.zero_grad()
+            eff_nr_w = build_window_eff_nr(
+                ell_start, W_opt, mu_add_w, mu_remove_w,
+                mu_add_committed, mu_remove_committed,
+                mu_0_t, pad_mu0, pad_mus, n, device, dtype)
+
+            obj, _ = compute_objective(
+                pi_frozen, eff_nr_w,
+                lambda_t[ell_start:], alpha1_t[ell_start:], alpha2_t[ell_start:],
+                mu_add_w, mu_remove_w, config, device, dtype)
+
+            obj.backward()
+            opt.step()
+
+            with torch.no_grad():
+                mu_add_w.data.clamp_(min=0.0)
+                mu_remove_w.data.clamp_(min=0.0)
+                for j in range(W_opt):
+                    mu_remove_w.data[j].clamp_(max=mus_init[ell_start + j])
+                v = obj.item()
+                if prev_obj is not None and abs(prev_obj - v) < epsilon:
+                    break
+                prev_obj = v
+            sch.step(v)
+
+        window_objectives.append(v)
+
+        with torch.no_grad():
+            add_np = mu_add_w.data.cpu().numpy()
+            rem_np = mu_remove_w.data.cpu().numpy()
+            mu_add_committed[ell_start:ell_commit_end] = add_np[:W_commit]
+            mu_remove_committed[ell_start:ell_commit_end] = rem_np[:W_commit]
+
+            # Warm start for next window
+            if W_commit < W_opt:
+                warm_add = add_np[W_commit:]
+                warm_remove = rem_np[W_commit:]
+            else:
+                warm_add = None
+                warm_remove = None
+
+            eff_nr_full = build_eff_nr_zero_pad(
+                mu_0_t,
+                torch.tensor(mu_add_committed, dtype=dtype, device=device),
+                torch.tensor(mu_remove_committed, dtype=dtype, device=device),
+                pad_mu0, pad_mus)
+
+            pi_current = propagate_pi(
+                pi_current, eff_nr_full[ell_start:ell_commit_end],
+                lambda_t[ell_start:ell_commit_end], config, device, dtype)
+
+            if sample_state:
+                pi_current, s_samp, n_samp = sample_state_from_pi(pi_current, config)
+                sampled_states.append((s_samp, n_samp))
+                if verbose:
+                    print(f"  Window {len(window_objectives)-1}: "
+                          f"obj={v:.2f}, sampled (s={s_samp}, n={n_samp})")
+
+        ell_start = ell_commit_end
+
+    # Final evaluation
+    total_obj, details, ts = evaluate_full_day(
+        mu_add_committed, mu_remove_committed,
+        lambdas, mus_init, alpha1, alpha2, config,
+        pi0=pi0, device=device, dtype=dtype)
+
+    return {
+        'mu_add': mu_add_committed,
+        'mu_remove': mu_remove_committed,
+        'objective': total_obj,
+        'details': details,
+        'window_objectives': window_objectives,
+        'sampled_states': sampled_states,
+    }
