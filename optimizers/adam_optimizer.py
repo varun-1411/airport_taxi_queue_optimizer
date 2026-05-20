@@ -29,6 +29,8 @@ def run_adam_transient(
     max_iterations=500, epsilon=1e-1, lr=1.0,
     max_time=None,
     checkpoint_every=None,  # outer-loop checkpoint every N iterations (None to disable)
+    pi0=None,               # initial distribution (carry from previous block)
+    eff_nr_base=None,       # fixed base effective mu (optimizer's mu_add/remove added on top)
     device='cpu', dtype=torch.float32,
     out_dir='results/adam_transient',
 ):
@@ -50,6 +52,8 @@ def run_adam_transient(
     max_iterations : int, max Adam iterations
     epsilon : float, convergence tolerance (delta objective)
     lr : float, Adam learning rate
+    pi0 : torch.Tensor or None, initial distribution carried from previous block
+    eff_nr_base : torch.Tensor or None, fixed base mu (optimizer's mu_add/remove added on top)
     device : str or torch.device
     dtype : torch.dtype
     out_dir : str, output directory for saving results
@@ -109,6 +113,8 @@ def run_adam_transient(
             device=device,
             dtype=dtype,
             checkpoint_every=checkpoint_every,
+            pi0_init=pi0,
+            eff_nr_base=eff_nr_base,
         )
         obj.backward()
         optimizer.step()

@@ -80,12 +80,12 @@ def run_simulation(
     interval_length = config.interval_length
     K_S, K_P, M = config.K_S, config.K_P, config.M
 
-    # Apply delays
-    pad_mu0, pad_mus = config.get_delay_blocks()
-    mu_eff = mu_0 - mus_removed
-    mu0_delayed = shift_with_wrap(mu_eff, pad_mu0)
-    mus_delayed = shift_with_wrap(mus_add, pad_mus)
-    effective_mu = mu0_delayed + mus_delayed
+    # Apply delays (with or without warmup)
+    mus_add_t = mus_add  # already tensor from above
+    mus_removed_t = mus_removed
+    effective_mu, warmup_eff_nr, n_warmup, _ = _apply_delays(
+        mu_0, mus_add_t, mus_removed_t, config, device, torch.float32
+    )
 
     # State vectors
     sv = make_state_vectors(K_S, K_P, M, device=device)
@@ -98,6 +98,15 @@ def run_simulation(
     N_states = (K_S + 1) * Nn
     pi0 = torch.zeros(N_states, dtype=torch.float32, device=device)
     pi0[M] = 1.0  # state (s=0, n=0) has index M
+
+    # Warmup phase: propagate pi through end-of-day intervals, no cost
+    if n_warmup > 0:
+        warmup_lambda = lambdas[-n_warmup:]
+        pi0 = _run_warmup(
+            pi0, warmup_eff_nr, warmup_lambda,
+            w_pass, w_stage, w_pick, w_block_pax, w_block_taxi,
+            K_S, K_P, M, config.tau, interval_length, device, torch.float32
+        )
 
     # Accumulators
     term_pax = torch.tensor(0.0, device=device)
@@ -301,11 +310,108 @@ def _run_interval_block(pi0, eff_nr_block, lambda_block, alpha1_block, alpha2_bl
     return pi, block_cost
 
 
+def _apply_delays(mu_0, mu_vals, mu_removed, config, device, dtype):
+    """
+    Apply delays to mu arrays.
+
+    If config.use_warmup is True:
+      - For the actual day: use shift_with_wrap so taxis dispatched at end-of-day
+        correctly arrive at the start (the delay pipeline is physical).
+      - Build warmup intervals from end-of-day with delays applied, so the
+        system's pi0 reflects the steady pipeline state at day boundary.
+      - Warmup uses 2 * max_delay intervals: the first max_delay intervals fill
+        the delay pipeline, and the second max_delay intervals are the ones whose
+        dispatched taxis spill into day-start.
+    Otherwise (default):
+      - Use shift_with_wrap, no warmup.
+
+    Returns
+    -------
+    eff_nr : effective non-reserved mu for each real interval (length = n_intervals)
+    warmup_eff_nr : effective mu for warmup intervals (length = 2*max_delay)
+    n_warmup : int, number of warmup intervals (0 if disabled)
+    warmup_lambda : lambda for warmup intervals (length = 2*max_delay, or empty)
+    """
+    pad_mu0, pad_mus = config.get_delay_blocks()
+    # mu_eff = mu_0 - mu_removed
+    # n = len(mu_0)
+
+    # # Day rates always use shift_with_wrap (the delay is physical)
+    # mu0_delayed = shift_with_wrap(mu_eff, pad_mu0)
+    # mus_delayed = shift_with_wrap(mu_vals, pad_mus)
+    # eff_nr = mu0_delayed + mus_delayed
+
+    # FIXED (zero-pad)
+    mu_eff = mu_0 - mu_removed
+
+    mu0_delayed = torch.zeros_like(mu_eff)
+    if pad_mu0 > 0:
+        mu0_delayed[pad_mu0:] = mu_eff[:-pad_mu0]
+    else:
+        mu0_delayed[:] = mu_eff
+
+    mus_delayed = torch.zeros_like(mu_vals)
+    if pad_mus > 0:
+        mus_delayed[pad_mus:] = mu_vals[:-pad_mus]
+    else:
+        mus_delayed[:] = mu_vals
+
+    eff_nr = mu0_delayed + mus_delayed
+
+
+    if not config.use_warmup:
+        empty = torch.zeros(0, device=device, dtype=dtype)
+        return eff_nr, empty, 0, empty
+    else:
+        # We need 2 * max_delay warmup intervals from end of day.
+        # Take a window of end-of-day rates, apply shift_with_wrap on that
+        # window to model the delay pipeline within the warmup period.
+        max_delay = max(pad_mu0, pad_mus)
+        n_warmup = 2 * max_delay
+
+        # Grab the last n_warmup intervals of the *full wrapped* arrays.
+        # These represent the system running through end-of-day with delays
+        # properly applied — exactly what happens before day-start.
+        warmup_eff_nr = eff_nr[-n_warmup:]
+
+        return eff_nr, warmup_eff_nr, n_warmup, None
+
+
+def _run_warmup(pi0, warmup_eff_nr, warmup_lambda,
+                w_pass, w_stage, w_pick, w_block_pax, w_block_taxi,
+                K_S, K_P, M, tau, interval_length, device, dtype):
+    """
+    Run warmup intervals: propagate pi forward without accumulating cost.
+    Returns warmed-up pi0.
+    """
+    pi = pi0
+    for j in range(len(warmup_lambda)):
+        Q, _, _ = build_Q_non_erlang_vec(
+            K_S=K_S, K_P=K_P, M=M,
+            lam=warmup_eff_nr[j], alpha=warmup_lambda[j], tau=tau,
+            device=device, dtype=dtype
+        )
+        P, gamma = build_P_from_Q(Q)
+        P = P.coalesce()
+        P_rows, P_cols = P.indices()[0], P.indices()[1]
+        P_vals_t = P.values()
+        W = torch.stack([w_pass, w_stage, w_pick, w_block_pax, w_block_taxi], dim=0)
+
+        _, _, _, _, _, pi_T = uniformized_with_checkpoint_blocks(
+            pi, P_rows, P_cols, P_vals_t, gamma, W,
+            interval_length, max_K_cap=30000, tol_tail=1e-12, block_size=60
+        )
+        pi = pi_T
+    return pi
+
+
 def compute_total_objective_uniformization(
     mu_0, lambda_vals, mu_vals, mu_removed,
     alpha1, alpha2, config,
     device=None, dtype=torch.float32,
-    checkpoint_every=None
+    checkpoint_every=None,
+    pi0_init=None,
+    eff_nr_base=None,
 ):
     """
     Compute total objective using uniformization with gradient checkpointing.
@@ -318,6 +424,24 @@ def compute_total_objective_uniformization(
         Trades recomputation time for memory savings during backward.
         Recommended ~20-30 for 288 intervals. None = no outer checkpointing
         (original behaviour, stores full graph).
+    pi0_init : torch.Tensor or None
+        If provided, use as the initial distribution instead of the empty-system
+        default. Useful for greedy block optimization where pi0 is carried
+        forward from the previous block.
+    eff_nr_base : torch.Tensor or None
+        If provided, this is the fixed base effective mu (from mu_0 with
+        previous blocks' delayed contributions already baked in). The
+        optimizer's mu_vals and mu_removed are then added on top:
+          eff_nr = eff_nr_base + mu_vals - mu_removed
+        This keeps gradients flowing through mu_vals/mu_removed while
+        correctly accounting for the delay pipeline from previous blocks.
+        If None, delays are computed normally via _apply_delays.
+
+    Notes
+    -----
+    If config.use_warmup is True (and pi0_init/eff_nr_base are not set),
+    the last 2*max_delay intervals from the end of the day are prepended as
+    warmup (pi is propagated but cost is not accumulated).
     """
     from torch.utils.checkpoint import checkpoint as cp
 
@@ -334,12 +458,17 @@ def compute_total_objective_uniformization(
     K_S, K_P, M = config.K_S, config.K_P, config.M
     interval_length = config.interval_length
 
-    # Apply delays
-    pad_mu0, pad_mus = config.get_delay_blocks()
-    mu_eff = mu_0 - mu_removed
-    mu0_delayed = shift_with_wrap(mu_eff, pad_mu0)
-    mus_delayed = shift_with_wrap(mu_vals, pad_mus)
-    eff_nr = mu0_delayed + mus_delayed
+    # Effective mu: base + optimizable adjustments, or full delay computation
+    if eff_nr_base is not None:
+        # Greedy block mode: base has delays from previous blocks baked in.
+        # mu_vals and mu_removed are the current block's optimizable params
+        # — add them directly so gradients flow through.
+        eff_nr = eff_nr_base.to(device=device, dtype=dtype) + mu_vals - mu_removed
+        n_warmup = 0
+    else:
+        eff_nr, warmup_eff_nr, n_warmup, _ = _apply_delays(
+            mu_0, mu_vals, mu_removed, config, device, dtype
+        )
 
     # State vectors
     sv = make_state_vectors(K_S, K_P, M, device=device, dtype=dtype)
@@ -349,8 +478,21 @@ def compute_total_objective_uniformization(
     # Initial distribution
     Nn = K_P + M + 1
     N_states = (K_S + 1) * Nn
-    pi0 = torch.zeros(N_states, dtype=dtype, device=device)
-    pi0[M] = 1.0
+
+    if pi0_init is not None:
+        pi0 = pi0_init.to(device=device, dtype=dtype)
+    else:
+        pi0 = torch.zeros(N_states, dtype=dtype, device=device)
+        pi0[M] = 1.0
+
+        # Warmup phase: propagate pi through end-of-day intervals, no cost
+        if n_warmup > 0:
+            warmup_lambda = lambda_vals[-n_warmup:]
+            pi0 = _run_warmup(
+                pi0, warmup_eff_nr, warmup_lambda,
+                w_pass, w_stage, w_pick, w_block_pax, w_block_taxi,
+                K_S, K_P, M, config.tau, interval_length, device, dtype
+            )
 
     n_intervals = len(lambda_vals)
 
@@ -462,17 +604,42 @@ def run_steady_state_evaluation(
     K_S, K_P, M = config.K_S, config.K_P, config.M
     interval_length = config.interval_length
 
-    # Apply delays
+    # Apply delays (always use roll = shift_with_wrap equivalent)
     pad_mu0, pad_mus = config.get_delay_blocks()
+    # mu_eff = mu_0_np - mus_removed_np
+    # mu0_delayed = np.roll(mu_eff, pad_mu0) if pad_mu0 > 0 else mu_eff.copy()
+    # mus_delayed = np.roll(mus_add_np, pad_mus) if pad_mus > 0 else mus_add_np.copy()
+    # effective_mu = mu0_delayed + mus_delayed\
+    # FIXED (zero-pad)
     mu_eff = mu_0_np - mus_removed_np
-    mu0_delayed = np.roll(mu_eff, pad_mu0) if pad_mu0 > 0 else mu_eff.copy()
-    mus_delayed = np.roll(mus_add_np, pad_mus) if pad_mus > 0 else mus_add_np.copy()
+
+    mu0_delayed = np.zeros_like(mu_eff)
+    if pad_mu0 > 0:
+        mu0_delayed[pad_mu0:] = mu_eff[:-pad_mu0]
+    else:
+        mu0_delayed[:] = mu_eff
+
+    mus_delayed = np.zeros_like(mus_add_np)
+    if pad_mus > 0:
+        mus_delayed[pad_mus:] = mus_add_np[:-pad_mus]
+    else:
+        mus_delayed[:] = mus_add_np
+
     effective_mu = mu0_delayed + mus_delayed
 
     cache = GeneratorCache(config, use_numpy=True)
 
     pi0 = np.zeros(cache.N)
     pi0[cache.empty_idx] = 1.0
+
+    # Warmup: run last 2*max_delay end-of-day intervals (with delays applied)
+    if config.use_warmup:
+        from model.steady_state import solve_steady_state_numpy as _ss_solve
+        max_delay = max(pad_mu0, pad_mus)
+        n_warmup_ss = 2 * max_delay
+        for j in range(n_warmup_ss):
+            idx = len(effective_mu) - n_warmup_ss + j
+            pi0 = _ss_solve(effective_mu[idx], lambdas_np[idx], cache, pi0, config)
 
     # Accumulators
     term_pax = 0.0

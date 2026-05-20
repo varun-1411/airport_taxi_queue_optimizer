@@ -29,6 +29,10 @@ class QueueConfig:
     delay_non_reserved: float = 10.0    # Deployment delay (minutes)
     delay_extra: float = 10.0           # Extra delay for added taxis
 
+    # Warm-start: instead of shift_with_wrap, prepend end-of-day intervals
+    # as warmup (propagate pi but don't count cost), then zero-pad delays.
+    use_warmup: bool = False
+
     # Cost parameters
     cost_per_vehicle_add: float = 150.0          # Cost to add one taxi
     fuel_cost: float = 200.0                     # Fuel cost per removed/lost taxi
@@ -98,3 +102,14 @@ class QueueConfig:
         pad_mu0 = int(np.ceil(self.delay_non_reserved / self.interval_length))
         pad_mus = int(np.ceil((self.delay_non_reserved + self.delay_extra) / self.interval_length))
         return pad_mu0, pad_mus
+
+    @property
+    def n_warmup(self) -> int:
+        """Number of warmup intervals (= 2 * max delay in blocks).
+
+        First max_delay intervals fill the delay pipeline,
+        second max_delay intervals are the ones whose dispatched
+        taxis spill into day-start.
+        """
+        pad_mu0, pad_mus = self.get_delay_blocks()
+        return 2 * max(pad_mu0, pad_mus)
