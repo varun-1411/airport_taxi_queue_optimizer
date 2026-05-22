@@ -710,7 +710,7 @@ if __name__ == '__main__':
     parser.add_argument('--buffer', type=int, default=None)
     parser.add_argument('--max_iter', type=int, default=200)
     parser.add_argument('--lr', type=float, default=1.0)
-    parser.add_argument('--epsilon', type=float, default=0.1)
+    parser.add_argument('--epsilon', type=float, default=10.0)
     parser.add_argument('--print_every', type=int, default=10)
     parser.add_argument('--sample_state', action='store_true')
     parser.add_argument('--n_stochastic', type=int, default=3,
