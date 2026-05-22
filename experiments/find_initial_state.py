@@ -34,10 +34,12 @@ from config import QueueConfig
 from data import load_default_data
 from optimizer_utils import (
     build_eff_nr_zero_pad,
+    build_eff_nr_cyclic,
     propagate_pi,
     make_pi0,
     get_distribution_stats,
     optimize_full_day,
+    compute_carryover_cost,
 )
 
 
@@ -77,19 +79,19 @@ def find_pi_optimized(
               f"E[n]={stats_before['E_n']:.2f}+/-{stats_before['std_n']:.2f}")
         print(f"    Top states: {top_str}")
 
-        # Step 1: Optimize
+        # Step 1: Optimize (cyclic wrapping for periodic fixed point)
         print(f"    Optimizing...", end=' ', flush=True)
         t0 = time.time()
         result = optimize_full_day(
             lambdas, mus_init, alpha1, alpha2, config,
             max_iter=max_iter, lr=lr, epsilon=epsilon,
-            seed=42, pi0=pi0, device=device, dtype=dtype)
+            seed=42, pi0=pi0, cyclic=True, device=device, dtype=dtype)
         print(f"obj={result['objective']:.2f} ({time.time()-t0:.1f}s)")
 
-        # Step 2: Propagate under optimal controls
+        # Step 2: Propagate under optimal controls (cyclic wrapping)
         mu_add_t = torch.tensor(result['mu_add'], dtype=dtype, device=device)
         mu_rem_t = torch.tensor(result['mu_remove'], dtype=dtype, device=device)
-        eff_nr = build_eff_nr_zero_pad(mu_0_t, mu_add_t, mu_rem_t, pad_mu0, pad_mus)
+        eff_nr = build_eff_nr_cyclic(mu_0_t, mu_add_t, mu_rem_t, pad_mu0, pad_mus)
 
         with torch.no_grad():
             pi_end = propagate_pi(pi0, eff_nr, lambda_t, config, device, dtype)
@@ -135,6 +137,23 @@ def find_pi_optimized(
             print(f"    Converged: ||pi_0 - pi_288||_1 < {tol}")
             break
 
+    # Compute carry-over: taxis in transit at end of day
+    mu_add_final = result['mu_add']
+    mu_rem_final = result['mu_remove']
+    carryover_add = mu_add_final[-pad_mus:] if pad_mus > 0 else np.array([])
+    carryover_dropoff = (mus_init[-pad_mu0:] - mu_rem_final[-pad_mu0:]) if pad_mu0 > 0 else np.array([])
+
+    # Compute carry-over cost (what yesterday paid for today's carry-over taxis)
+    co_cost, co_breakdown = compute_carryover_cost(
+        mu_add_final, mu_rem_final, alpha2, config)
+
+    print(f"\n    Carry-over (in-transit at day boundary):")
+    print(f"      External dispatch (last {pad_mus} intervals): {np.round(carryover_add, 4)}")
+    print(f"      Drop-off net (last {pad_mu0} intervals): {np.round(carryover_dropoff, 4)}")
+    print(f"      Carry-over cost: {co_cost:.2f} "
+          f"(dispatch={co_breakdown['dispatch']:.2f}, removal={co_breakdown['removal']:.2f})")
+    print(f"      True daily cost = zero-pad obj + {co_cost:.2f}")
+
     return {
         'pi0': pi0,
         'mu_add': result['mu_add'],
@@ -144,6 +163,10 @@ def find_pi_optimized(
         'stats': get_distribution_stats(pi0, config, device, dtype),
         'converged': pi_diff < tol,
         'n_rounds': len(history),
+        'carryover_add': carryover_add,
+        'carryover_dropoff': carryover_dropoff,
+        'carryover_cost': co_cost,
+        'carryover_breakdown': co_breakdown,
     }
 
 
@@ -318,7 +341,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_iter', type=int, default=500,
                         help='Max Adam iterations (default: 500)')
     parser.add_argument('--lr', type=float, default=1.0)
-    parser.add_argument('--epsilon', type=float, default=10)
+    parser.add_argument('--epsilon', type=float, default=1e-1)
     parser.add_argument('--out_dir', type=str, default='results/initial_state')
     args = parser.parse_args()
 
@@ -354,17 +377,23 @@ if __name__ == '__main__':
     np.save(os.path.join(args.out_dir, 'pi0.npy'), opt['pi0'].cpu().numpy())
     np.save(os.path.join(args.out_dir, 'mu_add.npy'), opt['mu_add'])
     np.save(os.path.join(args.out_dir, 'mu_remove.npy'), opt['mu_remove'])
+    np.save(os.path.join(args.out_dir, 'carryover_add.npy'), opt['carryover_add'])
+    np.save(os.path.join(args.out_dir, 'carryover_dropoff.npy'), opt['carryover_dropoff'])
+    np.save(os.path.join(args.out_dir, 'carryover_cost.npy'), np.array([opt['carryover_cost']]))
 
     # Summary
     print(f"\n{'-'*60}")
     print(f"  RESULT:")
-    print(f"    Converged:    {opt['converged']} ({opt['n_rounds']} rounds)")
-    print(f"    Objective:    {opt['objective']:.2f}")
-    print(f"    E[s]:         {opt['stats']['E_s']:.2f} +/- {opt['stats']['std_s']:.2f}")
-    print(f"    E[n]:         {opt['stats']['E_n']:.2f} +/- {opt['stats']['std_n']:.2f}")
+    print(f"    Converged:       {opt['converged']} ({opt['n_rounds']} rounds)")
+    print(f"    Objective:       {opt['objective']:.2f}")
+    print(f"    E[s]:            {opt['stats']['E_s']:.2f} +/- {opt['stats']['std_s']:.2f}")
+    print(f"    E[n]:            {opt['stats']['E_n']:.2f} +/- {opt['stats']['std_n']:.2f}")
     h = opt['history'][-1]
-    print(f"    ||pi_0-pi_N||: {h['pi_diff']:.8f}")
-    print(f"    Net taxi/day:  {h['net_add']:+.4f}")
+    print(f"    ||pi_0-pi_N||:   {h['pi_diff']:.8f}")
+    print(f"    Net taxi/day:    {h['net_add']:+.4f}")
+    print(f"    Carryover cost:  {opt['carryover_cost']:.2f}")
+    print(f"      (dispatch: {opt['carryover_breakdown']['dispatch']:.2f}, "
+          f"removal: {opt['carryover_breakdown']['removal']:.2f})")
 
     # Sensitivity
     sens = None
@@ -386,7 +415,11 @@ if __name__ == '__main__':
 
     summary = {'converged': opt['converged'], 'n_rounds': opt['n_rounds'],
                'objective': opt['objective'], 'stats': to_json(opt['stats']),
-               'history': to_json(opt['history'])}
+               'history': to_json(opt['history']),
+               'carryover_add': to_json(opt['carryover_add']),
+               'carryover_dropoff': to_json(opt['carryover_dropoff']),
+               'carryover_cost': opt['carryover_cost'],
+               'carryover_breakdown': opt['carryover_breakdown']}
     if sens:
         summary['sensitivity'] = to_json({k: v['objective'] for k, v in sens.items()})
     with open(os.path.join(args.out_dir, 'summary.json'), 'w') as f:
@@ -396,4 +429,14 @@ if __name__ == '__main__':
 
     print(f"\nTotal time: {time.time()-t_start:.1f}s")
     print(f"Saved to {args.out_dir}/")
-    print(f"\nUsage: --pi0 {args.out_dir}/pi0.npy")
+    print(f"\n  Files:")
+    print(f"    pi0.npy              - initial distribution")
+    print(f"    mu_add.npy           - optimal controls (for reference)")
+    print(f"    mu_remove.npy        - optimal controls (for reference)")
+    print(f"    carryover_add.npy    - in-transit dispatches at day boundary")
+    print(f"    carryover_dropoff.npy- in-transit drop-offs at day boundary")
+    print(f"\n  Usage in experiments:")
+    print(f"    from optimizer_utils import load_initial_state, apply_carryover")
+    print(f"    pi0, carryover = load_initial_state('{args.out_dir}', config, device, dtype)")
+    print(f"    # Then after building eff_nr with zero-pad:")
+    print(f"    eff_nr = apply_carryover(eff_nr, carryover, pad_mu0, pad_mus)")

@@ -30,6 +30,7 @@ from optimizer_utils import (
     run_do_nothing,
     evaluate_per_block,
     resolve_pi0,
+    load_initial_state,
 )
 
 
@@ -40,10 +41,16 @@ from optimizer_utils import (
 def run_experiment(lambdas, mus_init, alpha1, alpha2, config,
                    n_samples=5, commit_size=36, buffer_size=None,
                    max_iter=500, lr=1.0, epsilon=1e-1,
-                   base_seed=42, sample_state=True, pi0=None,
+                   base_seed=42, sample_state=True,
+                   pi0=None, carryover=None,
                    device='cpu', dtype=torch.float32):
     """Run full-day (once) + greedy/MPC (N times with sampling)."""
     results = {}
+    co_cost = 0.0
+    if carryover is not None:
+        co_cost = float(np.load(os.path.join(
+            os.path.dirname(carryover.get('_dir', '')), 'carryover_cost.npy'))[0]) \
+            if '_dir' in carryover else 0.0
 
     # Full-day: single deterministic run
     print(f"\n{'─'*50}")
@@ -53,7 +60,8 @@ def run_experiment(lambdas, mus_init, alpha1, alpha2, config,
     fd = optimize_full_day(
         lambdas, mus_init, alpha1, alpha2, config,
         max_iter=max_iter, lr=lr, epsilon=epsilon,
-        seed=base_seed, pi0=pi0, device=device, dtype=dtype)
+        seed=base_seed, pi0=pi0, carryover=carryover,
+        device=device, dtype=dtype)
     print(f"  Objective: {fd['objective']:.2f} ({time.time()-t0:.1f}s)")
     results['full_day'] = fd
 
@@ -75,7 +83,8 @@ def run_experiment(lambdas, mus_init, alpha1, alpha2, config,
             lambdas, mus_init, alpha1, alpha2, config,
             commit_size=commit_size, buffer_size=buffer_size,
             max_iter=max_iter, lr=lr, epsilon=epsilon,
-            seed=seed, sample_state=sample_state, pi0=pi0,
+            seed=seed, sample_state=sample_state,
+            pi0=pi0, carryover=carryover,
             device=device, dtype=dtype)
         gr_runs.append(gr)
         print(f"  Run {i+1}/{n_samples} (seed={seed}): obj={gr['objective']:.2f} ({time.time()-t0:.1f}s)")
@@ -93,11 +102,13 @@ def run_experiment(lambdas, mus_init, alpha1, alpha2, config,
             lambdas, mus_init, alpha1, alpha2, config,
             commit_size=commit_size,
             max_iter=max_iter, lr=lr, epsilon=epsilon,
-            seed=seed, sample_state=sample_state, pi0=pi0,
+            seed=seed, sample_state=sample_state,
+            pi0=pi0, carryover=carryover,
             device=device, dtype=dtype)
         mpc_runs.append(mpc)
         print(f"  Run {i+1}/{n_samples} (seed={seed}): obj={mpc['objective']:.2f} ({time.time()-t0:.1f}s)")
     results['mpc'] = mpc_runs
+    results['carryover_cost'] = co_cost
 
     return results
 
@@ -111,16 +122,23 @@ def print_statistics(results, lambdas, config, commit_size):
     dn_obj = results['do_nothing']['objective']
     gr_objs = np.array([r['objective'] for r in results['greedy']])
     mpc_objs = np.array([r['objective'] for r in results['mpc']])
+    co_cost = results.get('carryover_cost', 0.0)
     n = len(gr_objs)
 
     print(f"\n{'='*70}")
     print(f"RESULTS SUMMARY")
     print(f"{'='*70}")
 
-    print(f"\n  BENCHMARK:")
+    print(f"\n  BENCHMARK (zero-pad objective):")
     print(f"    Full-Day:   {fd_obj:>12.2f}")
     print(f"    Do-Nothing: {dn_obj:>12.2f}")
     print(f"    Improvement: {(dn_obj-fd_obj)/dn_obj*100:.2f}%")
+
+    if co_cost > 0:
+        print(f"\n  TRUE DAILY COST (zero-pad + carryover cost {co_cost:.2f}):")
+        print(f"    Full-Day:   {fd_obj + co_cost:>12.2f}")
+        print(f"    Greedy mean:{gr_objs.mean() + co_cost:>12.2f}")
+        print(f"    MPC mean:   {mpc_objs.mean() + co_cost:>12.2f}")
 
     print(f"\n  {'Method':<10} {'Mean':>12} {'Std':>12} {'Min':>12} {'Max':>12} {'Gap %':>10}")
     print(f"  {'─'*60}")
@@ -299,6 +317,7 @@ def save_results(results, out_dir):
     np.save(os.path.join(out_dir, 'mpc_mu_remove.npy'), mpc_rems)
 
     # Summary JSON
+    co_cost = results.get('carryover_cost', 0.0)
     summary = {
         'full_day': results['full_day']['objective'],
         'do_nothing': results['do_nothing']['objective'],
@@ -306,6 +325,10 @@ def save_results(results, out_dir):
         'greedy_std': float(np.std(gr_objs)),
         'mpc_mean': float(np.mean(mpc_objs)),
         'mpc_std': float(np.std(mpc_objs)),
+        'carryover_cost': co_cost,
+        'full_day_true': results['full_day']['objective'] + co_cost,
+        'greedy_mean_true': float(np.mean(gr_objs)) + co_cost,
+        'mpc_mean_true': float(np.mean(mpc_objs)) + co_cost,
     }
     with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
@@ -319,6 +342,8 @@ def save_results(results, out_dir):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run & Compare Optimizers')
+    parser.add_argument('--n_intervals', type=int, default=None,
+                        help='Number of intervals (default: all 288)')
     parser.add_argument('--n_samples', type=int, default=5,
                         help='Number of greedy/MPC runs')
     parser.add_argument('--commit', type=int, default=36,
@@ -332,13 +357,35 @@ if __name__ == '__main__':
     parser.add_argument('--sample_state', action='store_true',
                         help='Sample state at window boundaries')
     parser.add_argument('--pi0', type=str, default=None,
-                        help='Path to initial distribution .npy')
+                        help='Path to pi0.npy (use --initial_state_dir instead for full setup)')
+    parser.add_argument('--initial_state_dir', type=str, default=None,
+                        help='Path to initial state directory (loads pi0 + carryover)')
     parser.add_argument('--out_dir', type=str, default='results/comparison')
     args = parser.parse_args()
 
     config = QueueConfig()
     lambdas, mus_init = load_default_data(config)
-    alpha1, alpha2 = config.get_alpha_arrays()
+    if args.n_intervals is not None:
+        lambdas = lambdas[:args.n_intervals]
+        mus_init = mus_init[:args.n_intervals]
+    alpha1, alpha2 = config.get_alpha_arrays(size=len(lambdas))
+    device = 'cpu'; dtype = torch.float32
+
+    # Load initial state
+    pi0 = None
+    carryover = None
+    co_cost = 0.0
+
+    if args.initial_state_dir:
+        pi0, carryover = load_initial_state(
+            args.initial_state_dir, config, device, dtype)
+        co_path = os.path.join(args.initial_state_dir, 'carryover_cost.npy')
+        if os.path.exists(co_path):
+            co_cost = float(np.load(co_path)[0])
+        print(f"  Loaded initial state from {args.initial_state_dir}")
+        print(f"  Carryover cost: {co_cost:.2f}")
+    elif args.pi0:
+        pi0 = args.pi0  # resolve_pi0 handles string paths
 
     print("="*60)
     print("OPTIMIZER COMPARISON")
@@ -347,7 +394,8 @@ if __name__ == '__main__':
     print(f"  Commit:       {args.commit}")
     print(f"  Samples:      {args.n_samples}")
     print(f"  Sample state: {args.sample_state}")
-    print(f"  π₀:           {args.pi0 or '(0,0) default'}")
+    print(f"  Initial state: {args.initial_state_dir or args.pi0 or '(0,0) default'}")
+    print(f"  Carryover cost: {co_cost:.2f}")
     print("="*60)
 
     t0 = time.time()
@@ -362,8 +410,10 @@ if __name__ == '__main__':
         epsilon=args.epsilon,
         base_seed=args.seed,
         sample_state=args.sample_state,
-        pi0=args.pi0,
+        pi0=pi0,
+        carryover=carryover,
     )
+    results['carryover_cost'] = co_cost
 
     print_statistics(results, lambdas, config, args.commit)
     save_results(results, args.out_dir)

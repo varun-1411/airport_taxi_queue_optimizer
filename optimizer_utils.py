@@ -72,10 +72,35 @@ def build_eff_nr_zero_pad(mu_0, mu_add, mu_remove, pad_mu0, pad_mus):
     return mu0_d + mus_d
 
 
+def build_eff_nr_cyclic(mu_0, mu_add, mu_remove, pad_mu0, pad_mus):
+    """
+    Build effective mu array with CYCLIC wrapping for periodic fixed-point.
+
+    Same as build_eff_nr_zero_pad but wraps end-of-day controls to start-of-day.
+    A taxi dispatched at interval 286 with pad_mus=4 arrives at interval 290%288=2.
+    Use ONLY for finding the periodic fixed point π*.
+    For single-day optimization/evaluation, use build_eff_nr_zero_pad.
+
+    Works with both numpy and torch.
+    """
+    is_torch = torch.is_tensor(mu_0)
+    n = len(mu_0)
+    mu_eff = mu_0 - mu_remove
+
+    if is_torch:
+        mu0_d = torch.roll(mu_eff, shifts=int(pad_mu0), dims=0) if pad_mu0 > 0 else mu_eff.clone()
+        mus_d = torch.roll(mu_add, shifts=int(pad_mus), dims=0) if pad_mus > 0 else mu_add.clone()
+    else:
+        mu0_d = np.roll(mu_eff, shift=int(pad_mu0)) if pad_mu0 > 0 else mu_eff.copy()
+        mus_d = np.roll(mu_add, shift=int(pad_mus)) if pad_mus > 0 else mu_add.copy()
+
+    return mu0_d + mus_d
+
+
 def build_window_eff_nr(ell_start, W_opt, mu_add_w, mu_remove_w,
                         mu_add_committed, mu_remove_committed,
                         mu_0_tensor, pad_mu0, pad_mus,
-                        n_total, device, dtype):
+                        n_total, device, dtype, carryover=None):
     """
     Build effective mu for a window with pipeline carryover.
 
@@ -83,7 +108,8 @@ def build_window_eff_nr(ell_start, W_opt, mu_add_w, mu_remove_w,
       [0, ell_start): committed (fixed, no grad)
       [ell_start, ell_start+W_opt): optimizable (grad flows)
 
-    Applies zero-pad delay shift globally, then slices.
+    Applies zero-pad delay shift globally, injects day-boundary carryover,
+    then slices to the current window.
     """
     mu_add_full = torch.zeros(n_total, device=device, dtype=dtype)
     if ell_start > 0:
@@ -99,6 +125,8 @@ def build_window_eff_nr(ell_start, W_opt, mu_add_w, mu_remove_w,
 
     eff_nr_full = build_eff_nr_zero_pad(
         mu_0_tensor, mu_add_full, mu_remove_full, pad_mu0, pad_mus)
+    # Inject day-boundary carryover (affects first pad_mus intervals)
+    eff_nr_full = apply_carryover(eff_nr_full, carryover, pad_mu0, pad_mus)
     return eff_nr_full[ell_start:ell_start + W_opt]
 
 
@@ -200,6 +228,117 @@ def resolve_pi0(pi0_arg, config, device, dtype):
         return make_pi0(config, device, dtype, s=pi0_arg[0], n=pi0_arg[1])
     else:
         raise ValueError(f"Cannot resolve π₀ from: {type(pi0_arg)}")
+
+
+def load_initial_state(dir_path, config, device, dtype):
+    """
+    Load complete initial state: π₀ + carry-over from fixed-point calibration.
+
+    Returns
+    -------
+    pi0 : torch.Tensor, initial distribution
+    carryover : dict with 'add' and 'dropoff' arrays (or None if not found)
+
+    Usage:
+        pi0, carryover = load_initial_state('results/initial_state', config, device, dtype)
+        # Then in optimization:
+        eff_nr = build_eff_nr_zero_pad(mu_0, mu_add, mu_remove, pad_mu0, pad_mus)
+        eff_nr = apply_carryover(eff_nr, carryover, pad_mu0, pad_mus)
+    """
+    pi0 = load_pi0(os.path.join(dir_path, 'pi0.npy'), config, device, dtype)
+
+    carryover = None
+    co_add_path = os.path.join(dir_path, 'carryover_add.npy')
+    co_drop_path = os.path.join(dir_path, 'carryover_dropoff.npy')
+    if os.path.exists(co_add_path) and os.path.exists(co_drop_path):
+        carryover = {
+            'add': np.load(co_add_path),
+            'dropoff': np.load(co_drop_path),
+        }
+
+    return pi0, carryover
+
+
+def apply_carryover(eff_nr, carryover, pad_mu0, pad_mus):
+    """
+    Inject carry-over taxis into zero-padded eff_nr.
+
+    Yesterday's dispatches (last pad_mus intervals) arrive today (first pad_mus).
+    Yesterday's drop-offs (last pad_mu0 intervals) arrive today (first pad_mu0).
+
+    Grad-safe: adds a constant tensor (no in-place ops on grad tensors).
+    If carryover is None, returns eff_nr unchanged.
+    """
+    if carryover is None:
+        return eff_nr
+
+    is_torch = torch.is_tensor(eff_nr)
+    co_add = carryover['add']
+    co_drop = carryover['dropoff']
+
+    if is_torch:
+        # Build constant tensor to add (grad-safe)
+        co_tensor = torch.zeros_like(eff_nr)
+        if len(co_add) > 0 and pad_mus > 0:
+            k = min(len(co_add), pad_mus, len(eff_nr))
+            co_tensor[:k] = co_tensor[:k] + torch.tensor(
+                co_add[-k:], dtype=eff_nr.dtype, device=eff_nr.device)
+        if len(co_drop) > 0 and pad_mu0 > 0:
+            k = min(len(co_drop), pad_mu0, len(eff_nr))
+            co_tensor[:k] = co_tensor[:k] + torch.tensor(
+                co_drop[-k:], dtype=eff_nr.dtype, device=eff_nr.device)
+        eff_nr = eff_nr + co_tensor  # simple addition, grad flows through eff_nr
+    else:
+        eff_nr = eff_nr.copy()
+        if len(co_add) > 0 and pad_mus > 0:
+            k = min(len(co_add), pad_mus, len(eff_nr))
+            eff_nr[:k] += co_add[-k:]
+        if len(co_drop) > 0 and pad_mu0 > 0:
+            k = min(len(co_drop), pad_mu0, len(eff_nr))
+            eff_nr[:k] += co_drop[-k:]
+
+    return eff_nr
+
+
+def compute_carryover_cost(mu_add, mu_remove, alpha2, config):
+    """
+    Compute the cost of carry-over dispatches/removals at the day boundary.
+
+    These costs were incurred yesterday but benefit today (via carry-over).
+    Add this to single-day zero-pad objective to get the true daily cost:
+        true_daily_cost = zero_pad_objective + carryover_cost
+
+    Parameters
+    ----------
+    mu_add : array, optimal controls from fixed-point (full day)
+    mu_remove : array, optimal controls from fixed-point (full day)
+    alpha2 : array, taxi idle cost weights
+
+    Returns
+    -------
+    carryover_cost : float
+    cost_breakdown : dict with 'dispatch' and 'removal' components
+    """
+    pad_mu0, pad_mus = config.get_delay_blocks()
+    n = len(mu_add)
+    dt = config.interval_length
+
+    # Dispatch cost: mu_add in last pad_mus intervals
+    dispatch_cost = 0.0
+    if pad_mus > 0:
+        for j in range(max(0, n - pad_mus), n):
+            dispatch_cost += mu_add[j] * dt * config.cost_per_vehicle_add
+
+    # Removal cost: mu_remove in last pad_mu0 intervals
+    removal_cost = 0.0
+    if pad_mu0 > 0:
+        for j in range(max(0, n - pad_mu0), n):
+            a2 = float(alpha2[j]) if j < len(alpha2) else float(alpha2[-1])
+            ctl = config.fuel_cost + config.time_to_city * a2
+            removal_cost += mu_remove[j] * dt * ctl
+
+    total = dispatch_cost + removal_cost
+    return total, {'dispatch': dispatch_cost, 'removal': removal_cost}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -363,7 +502,8 @@ def propagate_one_day(pi0, eff_nr, lambda_vals, config, device, dtype):
 @torch.no_grad()
 def evaluate_per_block(mu_add, mu_remove, lambdas, mus_init,
                        alpha1, alpha2, config, commit_size,
-                       pi0=None, device='cpu', dtype=torch.float32):
+                       pi0=None, carryover=None,
+                       device='cpu', dtype=torch.float32):
     """
     Evaluate controls block-by-block on the transient model.
 
@@ -380,6 +520,7 @@ def evaluate_per_block(mu_add, mu_remove, lambdas, mus_init,
     alpha2_t = torch.tensor(alpha2, dtype=dtype, device=device)
 
     eff_nr = build_eff_nr_zero_pad(mu_0_t, mu_add_t, mu_remove_t, pad_mu0, pad_mus)
+    eff_nr = apply_carryover(eff_nr, carryover, pad_mu0, pad_mus)
     W = get_weight_matrix(config, device, dtype)
 
     if pi0 is not None:
@@ -437,9 +578,10 @@ def evaluate_per_block(mu_add, mu_remove, lambdas, mus_init,
 @torch.no_grad()
 def evaluate_full_day(mu_add, mu_remove, lambdas, mus_init,
                       alpha1, alpha2, config,
-                      pi0=None, device='cpu', dtype=torch.float32):
+                      pi0=None, carryover=None,
+                      device='cpu', dtype=torch.float32):
     """
-    Evaluate controls over full day with zero-pad delays.
+    Evaluate controls over full day with zero-pad delays + optional carryover.
 
     Returns (total_obj, details_dict, queue_time_series).
     """
@@ -454,6 +596,7 @@ def evaluate_full_day(mu_add, mu_remove, lambdas, mus_init,
     alpha2_t = torch.tensor(alpha2, dtype=dtype, device=device)
 
     eff_nr = build_eff_nr_zero_pad(mu_0_t, mu_add_t, mu_remove_t, pad_mu0, pad_mus)
+    eff_nr = apply_carryover(eff_nr, carryover, pad_mu0, pad_mus)
     sv = get_state_vectors(config, device, dtype)
     W = get_weight_matrix(config, device, dtype)
 
@@ -510,7 +653,8 @@ def evaluate_full_day(mu_add, mu_remove, lambdas, mus_init,
 
 def optimize_full_day(lambdas, mus_init, alpha1, alpha2, config,
                       max_iter=300, lr=1.0, epsilon=1e-1, seed=42,
-                      pi0=None, device='cpu', dtype=torch.float32):
+                      pi0=None, cyclic=False, carryover=None,
+                      device='cpu', dtype=torch.float32):
     """
     Optimize mu_add, mu_remove over all intervals jointly.
 
@@ -518,11 +662,18 @@ def optimize_full_day(lambdas, mus_init, alpha1, alpha2, config,
     ----------
     pi0 : None, str, torch.Tensor, or (s, n) tuple
         Initial distribution. See resolve_pi0 for options.
+    cyclic : bool, if True use cyclic wrapping for delays (for periodic
+        fixed-point iteration). Default False = zero-pad.
+    carryover : dict or None, carry-over from previous day.
+        Only used when cyclic=False. Keys: 'add', 'dropoff'.
 
     Returns
     -------
     dict with mu_add, mu_remove, objective, eff_nr, details, history
     """
+    _build_eff = build_eff_nr_cyclic if cyclic else build_eff_nr_zero_pad
+    # Carryover only applies with zero-pad (cyclic wraps automatically)
+    _carryover = carryover if not cyclic else None
     torch.manual_seed(seed)
     rng = np.random.RandomState(seed)
 
@@ -548,7 +699,8 @@ def optimize_full_day(lambdas, mus_init, alpha1, alpha2, config,
     prev = None
     for step in range(max_iter):
         opt.zero_grad()
-        eff = build_eff_nr_zero_pad(mu_0_t, mu_add, mu_remove, pad_mu0, pad_mus)
+        eff = _build_eff(mu_0_t, mu_add, mu_remove, pad_mu0, pad_mus)
+        eff = apply_carryover(eff, _carryover, pad_mu0, pad_mus)
         obj, _ = compute_objective(
             pi0_t, eff, lambda_t, alpha1_t, alpha2_t,
             mu_add, mu_remove, config, device, dtype)
@@ -567,7 +719,8 @@ def optimize_full_day(lambdas, mus_init, alpha1, alpha2, config,
         sch.step(v)
 
     with torch.no_grad():
-        eff = build_eff_nr_zero_pad(mu_0_t, mu_add, mu_remove, pad_mu0, pad_mus)
+        eff = _build_eff(mu_0_t, mu_add, mu_remove, pad_mu0, pad_mus)
+        eff = apply_carryover(eff, _carryover, pad_mu0, pad_mus)
         fobj, details = compute_objective_detailed(
             pi0_t, eff, lambda_t, alpha1_t, alpha2_t,
             mu_add, mu_remove, config, device, dtype)
@@ -620,7 +773,7 @@ def run_do_nothing(lambdas, mus_init, alpha1, alpha2, config,
 def optimize_greedy(lambdas, mus_init, alpha1, alpha2, config,
                     commit_size=36, buffer_size=None,
                     max_iter=200, lr=1.0, epsilon=1e-1, seed=42,
-                    sample_state=False, pi0=None,
+                    sample_state=False, pi0=None, carryover=None,
                     device='cpu', dtype=torch.float32, verbose=False):
     """
     Greedy rolling-horizon Adam optimization.
@@ -631,6 +784,7 @@ def optimize_greedy(lambdas, mus_init, alpha1, alpha2, config,
     buffer_size : int or None, lookahead buffer (default=pad_mus)
     sample_state : bool, sample state at window boundaries
     pi0 : initial distribution (None, str path, tensor, or (s,n) tuple)
+    carryover : dict or None, day-boundary carry-over from find_initial_state
 
     Returns
     -------
@@ -681,7 +835,8 @@ def optimize_greedy(lambdas, mus_init, alpha1, alpha2, config,
             eff_nr_w = build_window_eff_nr(
                 ell_start, W_opt, mu_add_w, mu_remove_w,
                 mu_add_committed, mu_remove_committed,
-                mu_0_t, pad_mu0, pad_mus, n, device, dtype)
+                mu_0_t, pad_mu0, pad_mus, n, device, dtype,
+                carryover=carryover)
 
             obj, _ = compute_objective(
                 pi_frozen, eff_nr_w,
@@ -754,7 +909,7 @@ def optimize_greedy(lambdas, mus_init, alpha1, alpha2, config,
 def optimize_mpc(lambdas, mus_init, alpha1, alpha2, config,
                  commit_size=36,
                  max_iter=500, lr=1.0, epsilon=1e-1, seed=42,
-                 sample_state=False, pi0=None,
+                 sample_state=False, pi0=None, carryover=None,
                  warm_start=None,
                  device='cpu', dtype=torch.float32, verbose=False):
     """
@@ -767,6 +922,7 @@ def optimize_mpc(lambdas, mus_init, alpha1, alpha2, config,
     warm_start : dict or None, {'mu_add': array, 'mu_remove': array}
     sample_state : bool, sample state at window boundaries
     pi0 : initial distribution
+    carryover : dict or None, day-boundary carry-over
 
     Returns
     -------
@@ -829,7 +985,8 @@ def optimize_mpc(lambdas, mus_init, alpha1, alpha2, config,
             eff_nr_w = build_window_eff_nr(
                 ell_start, W_opt, mu_add_w, mu_remove_w,
                 mu_add_committed, mu_remove_committed,
-                mu_0_t, pad_mu0, pad_mus, n, device, dtype)
+                mu_0_t, pad_mu0, pad_mus, n, device, dtype,
+                carryover=carryover)
 
             obj, _ = compute_objective(
                 pi_frozen, eff_nr_w,
